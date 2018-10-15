@@ -170,7 +170,14 @@ def build_base_model(model_opt, fields, gpu, checkpoint=None):
         src_dict = fields["src"].vocab
         feature_dicts = inputters.collect_feature_vocabs(fields, 'src')
         src_embeddings = build_embeddings(model_opt, src_dict, feature_dicts)
-        encoder = build_encoder(model_opt, src_embeddings)
+
+        # === changed lines (added branch) ===
+        if model_opt.encoder_type == 'transformerLM':
+            encoder = build_decoder(model_opt, src_embeddings)
+        else:
+            encoder = build_encoder(model_opt, src_embeddings)
+        # === changed lines end ===
+
     elif model_opt.model_type == "img":
         if ("image_channel_size" not in model_opt.__dict__):
             image_channel_size = 3

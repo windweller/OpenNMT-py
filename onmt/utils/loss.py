@@ -29,10 +29,28 @@ def build_loss_compute(model, tgt_vocab, opt, train=True):
     else:
         compute = NMTLossCompute(
             model.generator, tgt_vocab,
-            label_smoothing=opt.label_smoothing if train else 0.0)
+            label_smoothing=opt.label_smoothing if train else 0.0,
+            src_generator=model.src_generator, aux_strength=opt.aux_strength)
+        # TODO pass in aux strength here!!!!!
     compute.to(device)
 
     return compute
+
+
+# def build_aux_loss_compute(model, src_vocab, opt, train=True):
+#     device = torch.device("cuda" if onmt.utils.misc.use_gpu(opt) else "cpu")
+#
+#     if opt.copy_attn:
+#         compute = onmt.modules.CopyGeneratorLossCompute(
+#             model.src_generator, src_vocab, opt.copy_attn_force,
+#             opt.copy_loss_by_seqlength)
+#     else:
+#         compute = AuxLossCompute(
+#             model.src_generator, src_vocab,
+#             label_smoothing=opt.label_smoothing if train else 0.0)
+#     compute.to(device)
+#
+#     return compute
 
 
 class LossComputeBase(nn.Module):
@@ -55,13 +73,16 @@ class LossComputeBase(nn.Module):
         normalzation (str): normalize by "sents" or "tokens"
     """
 
-    def __init__(self, generator, tgt_vocab):
+    def __init__(self, generator, tgt_vocab, src_generator=None, aux_strength=0.5):
         super(LossComputeBase, self).__init__()
         self.generator = generator
         self.tgt_vocab = tgt_vocab
         self.padding_idx = tgt_vocab.stoi[inputters.PAD_WORD]
 
-    def _make_shard_state(self, batch, output, range_, attns=None):
+        self.src_generator = src_generator
+        self.aux_strength = aux_strength
+
+    def _make_shard_state(self, batch, output, range_, attns=None, enc_output=None):
         """
         Make shard state dictionary for shards() to return iterable
         shards for efficient loss computation. Subclass must define
@@ -104,13 +125,15 @@ class LossComputeBase(nn.Module):
         """
         range_ = (0, batch.tgt.size(0))
         shard_state = self._make_shard_state(batch, output, range_, attns)
-        _, batch_stats = self._compute_loss(batch, **shard_state)
+        _, _, batch_stats = self._compute_loss(batch, **shard_state)
 
         return batch_stats
 
+    # inside here .backward() is called
     def sharded_compute_loss(self, batch, output, attns,
                              cur_trunc, trunc_size, shard_size,
-                             normalization):
+                             normalization,
+                             enc_output=None, src_normalization=1):
         """Compute the forward loss and backpropagate.  Computation is done
         with shards and optionally truncation for memory efficiency.
 
@@ -133,18 +156,27 @@ class LossComputeBase(nn.Module):
           trunc_size (int) : length of truncation window
           shard_size (int) : maximum number of examples in a shard
           normalization (int) : Loss is divided by this number
+          aux_loss_compute (bool): we pass in the aux loss compute class
+          src_normalization (int): the length of source sentence
 
         Returns:
             :obj:`onmt.utils.Statistics`: validation loss statistics
 
         """
         batch_stats = onmt.utils.Statistics()
+        # we are not truncating in any circumstance
         range_ = (cur_trunc, cur_trunc + trunc_size)
-        shard_state = self._make_shard_state(batch, output, range_, attns)
+        shard_state = self._make_shard_state(batch, output, range_, attns, enc_output)
+
         for shard in shards(shard_state, shard_size):
-            loss, stats = self._compute_loss(batch, **shard)
-            loss.div(float(normalization)).backward()
+            loss, aux_loss, stats = self._compute_loss(batch, **shard)
+            total_loss = loss.div(float(normalization)) + self.aux_strength * aux_loss.div(float(src_normalization))
+
+            # loss.div(float(normalization)).backward() # this is clearly calling loss.backward() multiple times...is this ok!?
+            total_loss.backward()
+
             batch_stats.update(stats)
+
         return batch_stats
 
     def _stats(self, loss, scores, target):
@@ -160,9 +192,9 @@ class LossComputeBase(nn.Module):
         pred = scores.max(1)[1]
         non_padding = target.ne(self.padding_idx)
         num_correct = pred.eq(target) \
-                          .masked_select(non_padding) \
-                          .sum() \
-                          .item()
+            .masked_select(non_padding) \
+            .sum() \
+            .item()
         num_non_padding = non_padding.sum().item()
         return onmt.utils.Statistics(loss.item(), num_non_padding, num_correct)
 
@@ -179,6 +211,7 @@ class LabelSmoothingLoss(nn.Module):
     KL-divergence between q_{smoothed ground truth prob.}(w)
     and p_{prob. computed by model}(w) is minimized.
     """
+
     def __init__(self, label_smoothing, tgt_vocab_size, ignore_index=-100):
         assert 0.0 < label_smoothing <= 1.0
         self.padding_idx = ignore_index
@@ -203,13 +236,59 @@ class LabelSmoothingLoss(nn.Module):
         return F.kl_div(output, model_prob, reduction='sum')
 
 
+# class AuxLossCompute(LossComputeBase):
+#     """
+#     Aux LM Loss Computation.
+#     Almost exactly the same as NMTLossCompute
+#     Except since source sentence is MUCH longer than target sentence
+#     we compute the average loss across sequence, so target loss is always larger
+#     """
+#
+#     def __init__(self, generator, tgt_vocab, label_smoothing=0.0):
+#         super(AuxLossCompute, self).__init__(generator, tgt_vocab)
+#         self.sparse = not isinstance(generator[1], nn.LogSoftmax)
+#         if label_smoothing > 0:
+#             self.criterion = LabelSmoothingLoss(
+#                 label_smoothing, len(tgt_vocab), ignore_index=self.padding_idx
+#             )
+#         elif self.sparse:
+#             self.criterion = SparsemaxLoss(
+#                 ignore_index=self.padding_idx, size_average=False
+#             )
+#         else:
+#             self.criterion = nn.NLLLoss(
+#                 ignore_index=self.padding_idx, reduction="sum"
+#             )
+#
+#     def _make_shard_state(self, batch, output, range_, attns=None):
+#         return {
+#             "output": output,
+#             "target": batch.src[range_[0] + 1: range_[1]],
+#         }
+#
+#     def _compute_loss(self, batch, output, target):
+#         bottled_output = self._bottle(output)
+#         if self.sparse:
+#             # for sparsemax loss, the loss function operates on the raw output
+#             # vector, not a probability vector. Hence it's only necessary to
+#             # apply the first part of the generator here.
+#             scores = self.generator[0](bottled_output)
+#         else:
+#             scores = self.generator(bottled_output)
+#         gtruth = target.view(-1)
+#
+#         loss = self.criterion(scores, gtruth)
+#         stats = self._stats(loss.clone(), scores, gtruth)
+#
+#         return loss, stats
+
 class NMTLossCompute(LossComputeBase):
     """
     Standard NMT Loss Computation.
     """
 
     def __init__(self, generator, tgt_vocab, normalization="sents",
-                 label_smoothing=0.0):
+                 label_smoothing=0.0, src_generator=None, aux_strength=0.5):
         super(NMTLossCompute, self).__init__(generator, tgt_vocab)
         self.sparse = not isinstance(generator[1], nn.LogSoftmax)
         if label_smoothing > 0:
@@ -224,14 +303,18 @@ class NMTLossCompute(LossComputeBase):
             self.criterion = nn.NLLLoss(
                 ignore_index=self.padding_idx, reduction='sum'
             )
+        self.aux_strength = aux_strength
+        self.src_generator = src_generator
 
-    def _make_shard_state(self, batch, output, range_, attns=None):
+    def _make_shard_state(self, batch, output, range_, attns=None, enc_output=None):
         return {
             "output": output,
+            "enc_output": enc_output,
             "target": batch.tgt[range_[0] + 1: range_[1]],
+            "source": batch.src[0] # we have no truncation for the source
         }
 
-    def _compute_loss(self, batch, output, target):
+    def _compute_loss(self, batch, output, enc_output, target, source):
         bottled_output = self._bottle(output)
         if self.sparse:
             # for sparsemax loss, the loss function operates on the raw output
@@ -244,8 +327,17 @@ class NMTLossCompute(LossComputeBase):
 
         loss = self.criterion(scores, gtruth)
         stats = self._stats(loss.clone(), scores, gtruth)
+        # stats only contain decoder loss :)
 
-        return loss, stats
+        if self.src_generator is not None:
+            # add auxiliary loss
+            src_scores = self.src_generator(self._bottle(enc_output))
+            aux_loss = self.criterion(src_scores, source.view(-1))
+            aux_loss = aux_loss * self.aux_strength
+        else:
+            aux_loss = 0.
+
+        return loss, aux_loss, stats
 
 
 def filter_shard_state(state, shard_size=None):
@@ -270,7 +362,7 @@ def shards(state, shard_size, eval_only=False):
         state: A dictionary which corresponds to the output of
                *LossCompute._make_shard_state(). The values for
                those keys are Tensor-like or None.
-        shard_size: The maximum size of the shards yielded by the model.
+        shard_size: The maximum size of the shards yielded by the model. (max-generator-val = 2)
         eval_only: If True, only yield the state, nothing else.
               Otherwise, yield shards.
 
@@ -310,5 +402,10 @@ def shards(state, shard_size, eval_only=False):
             if isinstance(v, torch.Tensor) and state[k].requires_grad:
                 variables.extend(zip(torch.split(state[k], shard_size),
                                      [v_chunk.grad for v_chunk in v_split]))
+
+        # some grads are actually empty!! maybe we can filter them out?? (what will that do to the model traning?)
+        # you do not yet know WHY some grads are none though!!!! this is a hack
+        variables = [v for v in variables if v[1] is not None]
+
         inputs, grads = zip(*variables)
         torch.autograd.backward(inputs, grads)

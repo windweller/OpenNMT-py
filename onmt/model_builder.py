@@ -11,6 +11,7 @@ import onmt.inputters as inputters
 import onmt.modules
 from onmt.encoders.rnn_encoder import RNNEncoder
 from onmt.encoders.transformer import TransformerEncoder
+from onmt.encoders.transformer import TransformerEncoderLM
 from onmt.encoders.cnn_encoder import CNNEncoder
 from onmt.encoders.mean_encoder import MeanEncoder
 from onmt.encoders.audio_encoder import AudioEncoder
@@ -71,6 +72,10 @@ def build_encoder(opt, embeddings):
         return TransformerEncoder(opt.enc_layers, opt.enc_rnn_size,
                                   opt.heads, opt.transformer_ff,
                                   opt.dropout, embeddings)
+    elif opt.encoder_type == "transformerAuxLTR":
+        return TransformerEncoderLM(opt.enc_layers, opt.enc_rnn_size,
+                                    opt.heads, opt.transformer_ff,
+                                    opt.dropout, embeddings)
     elif opt.encoder_type == "cnn":
         return CNNEncoder(opt.enc_layers, opt.enc_rnn_size,
                           opt.cnn_kernel_width,
@@ -139,8 +144,8 @@ def load_test_model(opt, dummy_opt, model_path=None):
         model_opt.enc_rnn_size = model_opt.rnn_size
         model_opt.dec_rnn_size = model_opt.rnn_size
         if model_opt.model_type == 'text' and \
-           model_opt.enc_rnn_size != model_opt.dec_rnn_size:
-                raise AssertionError("""We do not support different encoder and
+                        model_opt.enc_rnn_size != model_opt.dec_rnn_size:
+            raise AssertionError("""We do not support different encoder and
                                      decoder rnn sizes for translation now.""")
     for arg in dummy_opt:
         if arg not in model_opt:
@@ -171,12 +176,7 @@ def build_base_model(model_opt, fields, gpu, checkpoint=None):
         feature_dicts = inputters.collect_feature_vocabs(fields, 'src')
         src_embeddings = build_embeddings(model_opt, src_dict, feature_dicts)
 
-        # === changed lines (added branch) ===
-        if model_opt.encoder_type == 'transformerLM':
-            encoder = build_decoder(model_opt, src_embeddings)
-        else:
-            encoder = build_encoder(model_opt, src_embeddings)
-        # === changed lines end ===
+        encoder = build_encoder(model_opt, src_embeddings)  # we added additional encoder: TransformerEncoderLM
 
     elif model_opt.model_type == "img":
         if ("image_channel_size" not in model_opt.__dict__):
@@ -218,11 +218,17 @@ def build_base_model(model_opt, fields, gpu, checkpoint=None):
 
     decoder = build_decoder(model_opt, tgt_embeddings)
 
+    lm_aux = model_opt.encoder_type == "transformerAuxLTR"
+
     # Build NMTModel(= encoder + decoder).
     device = torch.device("cuda" if gpu else "cpu")
-    model = onmt.models.NMTModel(encoder, decoder)
+    # the model will return more stuff
+    model = onmt.models.NMTModel(encoder, decoder, lm_aux=lm_aux)
 
     # Build Generator.
+    # Hmmm...generator is just hidden states -> word in vocab
+    # since we use shared embedding between encoder and decoder..plus shared embedding between
+    # decoder src to tgt...
     if not model_opt.copy_attn:
         if model_opt.generator_function == "sparsemax":
             gen_func = onmt.modules.sparse_activations.LogSparsemax(dim=-1)
@@ -238,16 +244,37 @@ def build_base_model(model_opt, fields, gpu, checkpoint=None):
         generator = CopyGenerator(model_opt.dec_rnn_size,
                                   fields["tgt"].vocab)
 
+    # Build Source Generator
+    # not considering copy attention right now
+    if lm_aux:
+        if model_opt.generator_function == "sparsemax":
+            gen_func = onmt.modules.sparse_activations.LogSparsemax(dim=-1)
+        else:
+            gen_func = nn.LogSoftmax(dim=-1)
+        # source vocab does not have <s> </s>, but share_vocab might be different...
+        src_generator = nn.Sequential(
+            nn.Linear(model_opt.enc_rnn_size, len(fields["src"].vocab)),
+            gen_func
+        )
+        # this would have made sure that both encoder and decoder share the same generator
+        if model_opt.share_decoder_embeddings:
+            src_generator[0].weight = src_embeddings.word_lut.weight
+
     # Load the model states from checkpoint or initialize them.
     if checkpoint is not None:
         model.load_state_dict(checkpoint['model'], strict=False)
         generator.load_state_dict(checkpoint['generator'], strict=False)
+        if lm_aux:
+            src_generator.load_state_dict(checkpoint['src_generator'], strict=False)
     else:
         if model_opt.param_init != 0.0:
             for p in model.parameters():
                 p.data.uniform_(-model_opt.param_init, model_opt.param_init)
             for p in generator.parameters():
                 p.data.uniform_(-model_opt.param_init, model_opt.param_init)
+            if lm_aux:
+                for p in src_generator.parameters():
+                    p.data.uniform_(-model_opt.param_init, model_opt.param_init)
         if model_opt.param_init_glorot:
             for p in model.parameters():
                 if p.dim() > 1:
@@ -255,6 +282,10 @@ def build_base_model(model_opt, fields, gpu, checkpoint=None):
             for p in generator.parameters():
                 if p.dim() > 1:
                     xavier_uniform_(p)
+            if lm_aux:
+                for p in src_generator.parameters():
+                    if p.dim() > 1:
+                        xavier_uniform_(p)
 
         if hasattr(model.encoder, 'embeddings'):
             model.encoder.embeddings.load_pretrained_vectors(
@@ -265,6 +296,8 @@ def build_base_model(model_opt, fields, gpu, checkpoint=None):
 
     # Add generator to model (this registers it as parameter of model).
     model.generator = generator
+    if lm_aux:
+        model.src_generator = src_generator
     model.to(device)
 
     return model

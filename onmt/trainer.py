@@ -32,13 +32,20 @@ def build_trainer(opt, device_id, model, fields,
         model_saver(:obj:`onmt.models.ModelSaverBase`): the utility object
             used to save the model
     """
+
+    # use this as flag to set up src aux lm objective
+    lm_aux = opt.encoder_type == "transformerLM"
+
+    # this just builds the loss objective!!
+
     train_loss = onmt.utils.loss.build_loss_compute(
         model, fields["tgt"].vocab, opt)
+    # only valid_loss is used to compute perplexity, so no worry!
     valid_loss = onmt.utils.loss.build_loss_compute(
         model, fields["tgt"].vocab, opt, train=False)
 
     trunc_size = opt.truncated_decoder  # Badly named...
-    shard_size = opt.max_generator_batches
+    shard_size = opt.max_generator_batches  # this = 2 in our setting
     norm_method = opt.normalization
     grad_accum_count = opt.accum_count
     n_gpu = opt.world_size
@@ -81,6 +88,8 @@ class Trainer(object):
             model_saver(:obj:`onmt.models.ModelSaverBase`): the saver is
                 used to save a checkpoint.
                 Thus nothing will be saved if this parameter is None
+            aux_loss(:obj:`onmt.utils.loss.LossComputeBase`): used when passed in,
+                almost identical to train_loss; could be LM_loss (LTR_Loss) or MLM_loss.
     """
 
     def __init__(self, model, train_loss, valid_loss, optim,
@@ -136,6 +145,7 @@ class Trainer(object):
         true_batchs = []
         accum = 0
         normalization = 0
+        src_normalization = 0
         train_iter = train_iter_fct()
 
         total_stats = onmt.utils.Statistics()
@@ -154,10 +164,16 @@ class Trainer(object):
                     true_batchs.append(batch)
 
                     if self.norm_method == "tokens":
+                        # newly added!!
+                        # TODO: if we need to pad this, we need to do this from outside...
+                        src_num_tokens = batch.src[1].sum()  # src[1] is the sentence lengths!
+                        src_normalization += src_num_tokens.item()  # get number of tokens right to normalize by length
+
                         num_tokens = batch.tgt[1:].ne(
                             self.train_loss.padding_idx).sum()
                         normalization += num_tokens.item()
                     else:
+                        src_normalization += batch.batch_size
                         normalization += batch.batch_size
                     accum += 1
                     if accum == self.grad_accum_count:
@@ -172,8 +188,13 @@ class Trainer(object):
                                                 .all_gather_list
                                                 (normalization))
 
+                            src_normalization = sum(onmt.utils.distributed
+                                                .all_gather_list
+                                                (src_normalization))
+
+                        # backprop is done here
                         self._gradient_accumulation(
-                            true_batchs, normalization, total_stats,
+                            true_batchs, normalization, src_normalization, total_stats,
                             report_stats)
 
                         report_stats = self._maybe_report_training(
@@ -235,7 +256,7 @@ class Trainer(object):
             tgt = inputters.make_features(batch, 'tgt')
 
             # F-prop through the model.
-            outputs, attns, _ = self.model(src, tgt, src_lengths)
+            outputs, attns, _ = self.model(src, tgt, src_lengths, train=False)
 
             # Compute loss.
             batch_stats = self.valid_loss.monolithic_compute_loss(
@@ -249,7 +270,8 @@ class Trainer(object):
 
         return stats
 
-    def _gradient_accumulation(self, true_batchs, normalization, total_stats,
+    # true function that updates the gradient
+    def _gradient_accumulation(self, true_batchs, normalization, src_normalization, total_stats,
                                report_stats):
         if self.grad_accum_count > 1:
             self.model.zero_grad()
@@ -274,22 +296,45 @@ class Trainer(object):
 
             tgt_outer = inputters.make_features(batch, 'tgt')
 
+            # I MUST do a monolithic loss, not a truncated loss
+            # BPTT is not compatible with grad_accum anyway, and we do grad_accum...
+
+            # If there's no truncation, the following loop is only executed ONCE!
             for j in range(0, target_size-1, trunc_size):
+
                 # 1. Create truncated target.
                 tgt = tgt_outer[j: j + trunc_size]
 
                 # 2. F-prop all but generator.
                 if self.grad_accum_count == 1:
                     self.model.zero_grad()
-                outputs, attns, dec_state = \
-                    self.model(src, tgt, src_lengths, dec_state)
 
-                # 3. Compute loss in shards for memory efficiency.
-                batch_stats = self.train_loss.sharded_compute_loss(
-                    batch, outputs, attns, j,
-                    trunc_size, self.shard_size, normalization)
-                total_stats.update(batch_stats)
-                report_stats.update(batch_stats)
+                if not self.model.lm_aux:
+                    outputs, attns, dec_state = \
+                        self.model(src, tgt, src_lengths, dec_state)
+
+                    # 3. Compute loss in shards for memory efficiency.
+                    batch_stats = self.train_loss.sharded_compute_loss(
+                        batch, outputs, attns, j,
+                        trunc_size, self.shard_size, normalization)
+                    total_stats.update(batch_stats)
+                    report_stats.update(batch_stats)
+                else:
+                    # enc_states = memory_bank `[src_len x batch_size x model_dim]`
+                    # ok!! right now it's still good!!
+                    enc_states, src_lengths, outputs, attns, dec_state = \
+                            self.model(src, tgt, src_lengths, dec_state, train=True)
+                    # import pdb
+                    # pdb.set_trace()
+                    batch_stats = self.train_loss.sharded_compute_loss(
+                        batch, outputs, attns, j,
+                        trunc_size, self.shard_size, normalization, enc_states, src_normalization)
+                    total_stats.update(batch_stats)
+                    report_stats.update(batch_stats)
+
+                # new! .backward() used to be inside sharded_compute_loss()
+                # but now we move it here!
+                # may or may not break?? .backward() is also called on each shard...
 
                 # 4. Update the parameters and statistics.
                 if self.grad_accum_count == 1:

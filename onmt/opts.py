@@ -54,15 +54,19 @@ def model_opts(parser):
                        Options are [text|img|audio].""")
 
     group.add_argument('-encoder_type', type=str, default='rnn',
-                       choices=['rnn', 'brnn', 'mean', 'transformer', 'cnn', 'transformerLM'],
-                       help="""Type of encoder layer to use. Non-RNN layers
-                       are experimental. Options are
-                       [rnn|brnn|mean|transformer|cnn|transformerLM].""")
+                       choices=['rnn', 'brnn', 'mean', 'transformer', 'cnn', 'transformerAuxLTR', 'transformerAuxMLM'],
+                       help="""Type of encoder layer to use. Non-RNN layers are experimental. 
+                       transformerMLM is Cloze task to pre-train encoder.
+                       Options are
+                       [rnn|brnn|mean|transformer|cnn|transformerAuxLTR|transformerAuxMLM].""")
     group.add_argument('-decoder_type', type=str, default='rnn',
                        choices=['rnn', 'transformer', 'cnn'],
                        help="""Type of decoder layer to use. Non-RNN layers
                        are experimental. Options are
                        [rnn|transformer|cnn].""")
+
+    group.add_argument('-aux_strength', type=float, default=1,
+                       help="""We scale down the auxiliary target's loss so that more focus is placed on decoder""")
 
     group.add_argument('-layers', type=int, default=-1,
                        help='Number of layers in enc/dec.')

@@ -162,8 +162,15 @@ class TransformerEncoderLMLayer(nn.Module):
             * outputs `[batch_size x src_len x model_dim]`
         """
         input_norm = self.layer_norm(inputs)
+
+        # source pad mask and target pad mask are the SAME! (should be)
+        dec_mask = torch.gt(mask +
+                            self.mask[:, :mask.size(1),
+                            :mask.size(1)], 0)
+
+        # we want self_attn, but it needs to be masked!
         context, _ = self.self_attn(input_norm, input_norm, input_norm,
-                                    mask=mask)
+                                    mask=dec_mask)
         out = self.dropout(context) + inputs
         return self.feed_forward(out)
 
@@ -230,6 +237,8 @@ class TransformerEncoderLM(EncoderBase):
              for _ in range(num_layers)])
         self.layer_norm = onmt.modules.LayerNorm(d_model)
 
+        self.lm_aux = True  # a marker
+
     def forward(self, src, lengths=None):
         """ See :obj:`EncoderBase.forward()`"""
         self._check_args(src, lengths)
@@ -247,5 +256,7 @@ class TransformerEncoderLM(EncoderBase):
             out = self.transformer[i](out, mask)
         out = self.layer_norm(out)
 
+        # memory_bank: [src_len x batch x hidden] (after transpose) (memory bank)
+        # in this scenario, TransformerEncoder only has sequential context
         return emb, out.transpose(0, 1).contiguous(), lengths
 

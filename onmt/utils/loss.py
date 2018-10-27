@@ -329,7 +329,7 @@ class NMTLossCompute(LossComputeBase):
         stats = self._stats(loss.clone(), scores, gtruth)
         # stats only contain decoder loss :)
 
-        if self.src_generator is not None:
+        if self.src_generator is not None and enc_output is not None:
             # add auxiliary loss
             src_scores = self.src_generator(self._bottle(enc_output))
             aux_loss = self.criterion(src_scores, source.view(-1))
